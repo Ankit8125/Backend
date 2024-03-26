@@ -4,6 +4,8 @@ import {User} from "../models/user.model.js"
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import jwt from "jsonwebtoken"
+import fs from "fs"
+import mongoose from "mongoose";
 
 const generateAccessAndRefreshTokens = async(userId)=>{
     try {
@@ -243,7 +245,7 @@ const changeCurrentPassword = asyncHandler( async(req, res)=> {
 const getCurrentUser = asyncHandler( async(req, res)=>{
     return res
     .status(200)
-    .json(200, req.user, "Current User Fetched Successfully")
+    .json(new ApiResponse(200, req.user, "Current User Fetched Successfully"))
 })
 
 const updateAccountDetails = asyncHandler(async(req, res)=>{
@@ -253,7 +255,7 @@ const updateAccountDetails = asyncHandler(async(req, res)=>{
         throw new ApiError(400, "All fields are required")
     }
 
-    const user = User.findByIdAndUpdate(
+    const user = await User.findByIdAndUpdate(
         req.user?._id,
         {
             $set:{
@@ -276,14 +278,29 @@ const updateUserAvatar = asyncHandler( async( req, res)=>{
     if(!avatarLocalPath){
         throw new ApiError(400, "Avatar file is missing")
     }
-
+    
     const avatar = await uploadOnCloudinary(avatarLocalPath)
 
     if(!avatar.url){
         throw new ApiError(400, "Error while uploading on avatar")
     }
 
-    const user = await User.findByIdAndUpdate(
+    // Retrieve the old avatar URL from the database
+    const user = await User.findById(req.user?._id).select("avatar");
+
+    if (!user) {
+        throw new ApiError(404, "User not found");
+    }
+
+    const oldAvatarUrl = user.avatar;
+
+    // Delete the old avatar image from cloud storage
+    if (oldAvatarUrl) {
+        await deleteFromCloudinary(oldAvatarUrl);
+    }
+
+    // Update the user's avatar in the database
+    const updatedUser = await User.findByIdAndUpdate(
         req.user?._id,
         {
             $set:{
@@ -293,10 +310,19 @@ const updateUserAvatar = asyncHandler( async( req, res)=>{
         {new: true}
     ).select("-password")
 
+    // Delete the previous local avatar image from the server's file system
+    if (oldAvatarUrl) {
+        try {
+            fs.unlinkSync(oldAvatarUrl)
+        } catch (error) {
+            console.error("Error deleting previous avatar image:", error)
+        }
+    }
+
     return res
     .status(200)
     .json(
-        new ApiResponse(200, user, "Avatar updated successfully")
+        new ApiResponse(200, updatedUser, "Avatar updated successfully")
     )
 
 })
@@ -331,6 +357,131 @@ const updateUserCoverImage = asyncHandler( async( req, res)=>{
     )
 })
 
+const getUserChannelProfile = asyncHandler( async(req, res)=>{
+    const {username} = req.params
+
+    if(!username?.trim()){
+        throw new ApiError(400, "Username is missing")
+    }
+
+    const channel = await User.aggregate([
+        {
+            $match: { // Filters the documents to pass only the documents that match the specified condition(s) to the next pipeline stage.
+                username: username?.toLowerCase()
+            }
+        },
+        {
+            $lookup:{ // performs an equality match on the localField to the foreignField from the documents of the form collection
+                from: "subscriptions",
+                localField: "_id",
+                foreignField: "channel",
+                as: "subscribers"
+            }
+        }, // Each set of {} is a different pipeline
+        {
+            $lookup:{ 
+                from: "subscriptions",
+                localField: "_id",
+                foreignField: "subscriber",
+                as: "subscribedTo"
+            }
+        },
+        {
+            $addFields: {
+                subscriberCount: {
+                    $size: "$subscribers" // use '$' in subscribers as its a field
+                },
+                channelsSubscribedToCount:{
+                    $size: "$subscribedTo"
+                },
+                isSubscribed: {
+                    $cond: {
+                        // in- checks in both arrays and object: 
+                        // check if "req.user?._id" is there in "$subscribers" field -> in that go to "subscriber" (from subscription.model.js) and check if req.user?._id there or not!
+                        if: {$in: [req.user?._id, "$subscribers.subscriber"]}, 
+                        then: true,
+                        else: false
+                    }
+                }
+            }
+        },
+        {
+            $project: { // which things to be shown
+                fullName: 1, // 1 means show it 
+                username: 1,
+                subscriberCount: 1,
+                channelsSubscribedToCount: 1,
+                isSubscribed: 1,
+                avatar: 1,
+                coverImage: 1,
+                email: 1
+            }
+        }
+    ])
+
+    if(!channel?.length()){
+        throw new ApiError(404, "Channel does not exist")
+    }
+
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200, channel[0], "User channel fetched successfully")
+    )
+
+})
+
+const getWatchHistory = asyncHandler( async(req, res)=>{
+    // interview que: what do we get in output of : user.req._id ?
+    const user = await User.aggregate([
+        {
+            $match: {
+                _id: new mongoose.Types.ObjectId.createFromTime(req.user._id) // here agg. pipeline works and not mongoose, so we write it this way
+            }
+        },
+        {
+            $lookup: {
+                from: "videos", // mongoose makes into lower case + 's'
+                localField: "watchHistory",
+                foreignField: "_id",
+                as: "watchHistory",
+                pipeline:[
+                    {
+                        $lookup: {
+                            from: "users",
+                            localField: "owner",
+                            foreignField: "_id",
+                            as: "owner", // we will array of owners having below details
+                            pipeline:[
+                                {
+                                    $project: {
+                                        fullName: 1,
+                                        username: 1,
+                                        avatar: 1
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        $addFields: {
+                            owner: {
+                                $first: "$owner"
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    ])
+
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200, user[0].watchHistory, "Watch History fetched successfully")
+    )
+})
+
 export { 
     registerUser,
     loginUser,
@@ -340,5 +491,7 @@ export {
     getCurrentUser,
     updateAccountDetails,
     updateUserAvatar,
-    updateUserCoverImage
+    updateUserCoverImage,
+    getUserChannelProfile,
+    getWatchHistory
 }
